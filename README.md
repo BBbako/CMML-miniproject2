@@ -5,11 +5,11 @@ This repository contains all materials for a mini-project benchmarking automatic
 
 ## 🧪 Project Contents
 
-📁 cellassign/ # Local copy of CellAssign R package with source code modifications
-📄 CMML_ICA2.Rmd # Main RMarkdown report with CellAssign + SingleR analysis
-📄 scANVI.ipynb # Python notebook for scANVI annotation using scvi-tools
-📄 README.md # Project summary and usage instructions
-
+📁 cellassign/ # Local copy of CellAssign R package with source code modifications.
+📄 CMML_ICA2.Rmd # Main RMarkdown report with CellAssign + SingleR analysis.
+📄 scANVI.ipynb # Python notebook for scANVI annotation using scvi-tools.
+📄 README.md # Project summary and usage instructions.
+📄 scanvi_labels.csv #The results of scanvi, used for benchmark.
 
 ## 📊 Description
 
