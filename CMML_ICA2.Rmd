@@ -1,0 +1,299 @@
+---
+title: "ICA2"
+author: "djy"
+date: "2025-05-07"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(reticulate)
+use_virtualenv("C:/Users/ASUS/Documents/.virtualenvs/r-tensorflow", required = TRUE)
+library(devtools)
+load_all("C:/Users/ASUS/cellassign/")
+
+```
+
+```{r}
+# Core Bioconductor & single-cell packages
+library(SingleCellExperiment)
+library(scater)
+library(scran)
+library(cellassign)
+library(SingleR)
+library(celldex)
+library(tidyverse)
+library(tictoc)
+library(Matrix)
+library(TENxPBMCData)
+library(biomaRt)
+library(caret)
+library(pheatmap)
+library(MLmetrics)
+library(yardstick)
+library(dplyr)
+```
+## Step 1: Load and Preprocess Data
+
+```{r data-prep}
+# Load PBMC 68k dataset
+sce <- TENxPBMCData("pbmc68k")
+
+# Quality control
+sce <- addPerCellQC(sce)
+sce <- sce[, sce$sum > 1000 & sce$detected > 500]
+
+# Normalize & get top 2000 HVGs
+sce <- computeSumFactors(sce)
+sce <- logNormCounts(sce)
+dec <- modelGeneVar(sce)
+top_hvgs <- getTopHVGs(dec, n = 2000)
+
+
+# PCA + UMAP/tSNE for embedding
+set.seed(42)
+sce <- runPCA(sce, subset_row = top_hvgs)
+sce <- runUMAP(sce, dimred = "PCA")
+sce <- runTSNE(sce, dimred = "PCA")
+```
+
+## Step 2: Prepare Marker Matrix (for CellAssign)
+
+```{r marker-matrix}
+
+#basic markers
+pbmc_markers <- list(
+  "B cells" = c("CD19", "MS4A1"),
+  "T cells" = c("CD3D", "CD3E", "CD3G"),
+  "NK cells" = c("NKG7", "GNLY"),
+  "Monocytes" = c("CD14", "LYZ"),
+  "Dendritic cells" = c("FCER1A", "CST3")
+)
+marker_mat <- marker_list_to_mat(pbmc_markers, include_other = FALSE)
+
+#reinforce markers
+pbmc_markers <- list(
+  "B cells" = c("CD19", "MS4A1", "CD79A", "CD79B"),
+  "T cells" = c("CD3D", "CD3E", "CD3G", "CD2", "CD247", "IL7R", "TRAC"),
+  "NK cells" = c("NKG7", "GNLY"),
+  "Monocytes" = c("CD14", "LYZ"),
+  "Dendritic cells" = c("FCER1A", "CST3")
+)
+marker_mat <- marker_list_to_mat(pbmc_markers, include_other = FALSE)
+```
+
+## Step 3: CellAssign Annotation
+
+```{r cellassign-run, results='hide', message=FALSE}
+colnames(sce) <- sce$Barcode
+mart <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+
+# 2. Get the mapping of Ensembl ID -> HGNC symbol
+gene_map <- getBM(
+  attributes = c("ensembl_gene_id", "hgnc_symbol"),
+  filters = "ensembl_gene_id",
+  values = rownames(sce),
+  mart = mart
+)
+
+# 3. purge mapping table
+gene_map <- gene_map[gene_map$hgnc_symbol != "", ]
+gene_map <- gene_map[!duplicated(gene_map$ensembl_gene_id), ]
+
+# 4. Replace rownames in SCE (Ensembl ID -> Symbol)
+ens_ids <- rownames(sce)
+mapped_symbols <- gene_map$hgnc_symbol[match(ens_ids, gene_map$ensembl_gene_id)]
+
+rownames(sce) <- mapped_symbols
+
+# 5. Remove rows that were not mapped successfully
+sce <- sce[!is.na(rownames(sce)), ]
+# take an intersection (math.)
+marker_genes <- intersect(rownames(marker_mat), rownames(sce))
+
+# Extracting expression data and setting row names
+sce_ca <- sce[marker_genes, ]
+sce_ca <- sce_ca[, Matrix::colSums(counts(sce_ca)) > 0]
+original_barcodes <- colnames(sce_ca)
+# Ensure that marker_mat and sce_ca are in the same gene order
+marker_mat_used <- marker_mat[rownames(sce_ca), , drop = FALSE]
+
+# Setting marker matrix row names to match
+marker_mat_used <- marker_mat[marker_genes, , drop = FALSE]
+
+s <- sizeFactors(sce_ca)
+
+
+tic("CellAssign")
+fit <- cellassign(
+  exprs_obj = sce_ca,
+  marker_gene_info = marker_mat_used,
+  s = s,
+  learning_rate = 1e-2,
+  shrinkage = TRUE,
+  verbose = TRUE
+)
+toc()
+cellassign_time <- toc(log = TRUE)$toc - toc(log = TRUE)$tic
+
+sce_ca$CellAssign_labels <- fit$cell_type
+```
+```{r}
+## ---- cellassign-visualization --------------------------------------------
+
+# UMAP
+plotUMAP(sce_ca, colour_by = "CellAssign_labels") +
+  ggtitle("CellAssign UMAP") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# t-SNE
+plotTSNE(sce_ca, colour_by = "CellAssign_labels") +
+  ggtitle("CellAssign t-SNE")+
+  theme(plot.title = element_text(hjust = 0.5))
+
+# Histogram of the number of cells in each category
+df <- data.frame(label = sce_ca$CellAssign_labels)
+ggplot(df, aes(x = label, fill = label)) +
+  geom_bar(show.legend = FALSE) +
+  theme_minimal() +
+  ggtitle("CellAssign: Number of cell types annotated sub") +
+  xlab("Cell type") + ylab("Cell count") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# Heatmap (first 100 cells of gamma probability)
+if (!is.null(fit$mle_params$gamma)) {
+  gamma_mat <- fit$mle_params$gamma
+  rownames(gamma_mat) <- colnames(sce_ca)
+  pheatmap::pheatmap(
+    gamma_mat[1:min(100, nrow(gamma_mat)), ],
+    cluster_rows = TRUE, cluster_cols = TRUE,
+    main = "CellAssign A posteriori probability (γ) heat map"
+  )
+}
+
+# marker gene expression map 
+plotExpression(sce_ca, features = c("CD14", "CD3D", "CD19", "MS4A1"),
+               x = "CellAssign_labels", colour_by = "CellAssign_labels") +
+  ggtitle("Marker gene expression in each CellAssign annotated cell type") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+
+
+```
+
+```{r}
+## ---- prepare_reference --------------------------------------------------
+# Use of human PBMC reference data provided by celldex
+ref <- celldex::HumanPrimaryCellAtlasData()
+
+## ---- run_singler --------------------------------------------------------
+
+
+# Annotating with SingleR
+tic("SingleR")
+singler_pred <- SingleR(
+  test = sce,
+  ref = ref,
+  labels = ref$label.main
+)
+toc()
+## ---- assign_labels ------------------------------------------------------
+# Add predictions to colData
+colData(sce)$SingleR_labels <- singler_pred$labels
+
+## ---- visualize ----------------------------------------------------------
+
+plotUMAP(sce, colour_by = "SingleR_labels") +
+  ggtitle("SingleR UMAP") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+plotTSNE(sce, colour_by = "SingleR_labels") +
+  ggtitle("SingleR t-SNE ") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+## Step 5: Evaluation (Assume known `truth_labels` available)
+
+```{r evaluation}
+## ---- evaluation ------------------------------------------------------------
+
+
+get_multiclass_metrics <- function(pred, truth, method_name) {
+  pred <- as.character(pred)
+  truth <- as.character(truth)
+
+  common <- intersect(pred, truth)
+  keep <- which(pred %in% common & truth %in% common)
+
+  if (length(keep) == 0) stop("No overlapping labels between pred and truth.")
+
+  df <- data.frame(
+    truth = factor(truth[keep], levels = common),
+    pred  = factor(pred[keep],  levels = common)
+  )
+
+  acc <- yardstick::accuracy(df, truth = truth, estimate = pred)$.estimate
+  f1_macro <- yardstick::f_meas(df, truth = truth, estimate = pred, estimator = "macro")$.estimate
+  f1_micro <- yardstick::f_meas(df, truth = truth, estimate = pred, estimator = "micro")$.estimate
+  prec_macro <- yardstick::precision(df, truth = truth, estimate = pred, estimator = "macro")$.estimate
+  rec_macro <- yardstick::recall(df, truth = truth, estimate = pred, estimator = "macro")$.estimate
+
+  tibble(
+    Method = method_name,
+    Accuracy = round(acc, 3),
+    F1_macro = round(f1_macro, 3),
+    F1_micro = round(f1_micro, 3),
+    Precision_macro = round(prec_macro, 3),
+    Recall_macro = round(rec_macro, 3)
+  )
+}
+
+
+truth_ca_filtered <- singler_pred$labels[rownames(singler_pred) %in% colnames(sce_ca)]
+names(truth_ca_filtered) <- rownames(singler_pred)[rownames(singler_pred) %in% colnames(sce_ca)]
+label_map <- c(
+  "B cells" = "B_cell",
+  "T cells" = "T_cells",
+  "NK cells" = "NK_cell",
+  "Monocytes" = "Monocyte",
+  "Dendritic cells" = "DC"
+)
+pred_cellassign_filtered <- sce_ca$CellAssign_labels
+
+# Mapping CellAssign Predictive Labels to Uniform Format
+pred_cellassign_filtered_std <- label_map[as.character(pred_cellassign_filtered)]
+res_ca <- get_multiclass_metrics(pred_cellassign_filtered_std, truth_ca_filtered, "CellAssign")
+print(res_ca)
+# For example, there's the SingleR self-assessment comparison
+pred_singler <- singler_pred$labels[rownames(singler_pred) %in% colnames(sce_ca)]
+names(pred_singler) <- rownames(singler_pred)[rownames(singler_pred) %in% colnames(sce_ca)]
+
+res_sr <- get_multiclass_metrics(pred_singler, truth_ca_filtered, "SingleR")
+
+scanvi_df <- read.csv("D/data/scanvi_labels.csv", row.names = 1)
+scanvi_labels <- scanvi_df$scanvi_labels
+names(scanvi_labels) <- rownames(scanvi_df)
+
+res_scanvi <- get_multiclass_metrics(scanvi_labels, truth_ca_filtered, "scANVI")
+# Consolidation of assessment results
+results <- bind_rows(res_ca, res_sr, res_scanvi)
+
+
+results_long <- results %>%
+  pivot_longer(cols = -Method, names_to = "Metric", values_to = "Score")
+
+ggplot(results_long, aes(x = Method, y = Score, fill = Method)) +
+  geom_col(position = "dodge") +
+  geom_text(aes(label = round(Score, 2)), vjust = -0.3, size = 3) +
+  facet_wrap(~ Metric, scales = "free_y") +
+  theme_minimal() +
+  ylab("Score") +
+  ggtitle("Annotation Method Performance Comparison") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+
+
+
